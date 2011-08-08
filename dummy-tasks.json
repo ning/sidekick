@@ -1,0 +1,21 @@
+{
+    "initialize the server after it's started": {
+        "url": "/some/initialization-thingy",
+        "frequency": "initialize"       
+    }, 
+
+    "cleanup on shutdown": {
+        "url": "/time/to/shutdown",
+        "frequency": "shutdown"
+    },    
+    "announce": {
+        "url": "/ping/service/discovery/system",
+        "frequency": 60,
+        "start-delay": 3
+    },
+
+    "refresh some local cache": {
+        "url": "/cache/refresh?id=umbrella",
+        "frequency": 45
+    }
+}

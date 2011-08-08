@@ -1,0 +1,9 @@
+{
+   "appenders": [ {
+      "type": "logLevelFilter",
+      "level": "INFO",
+      "appender": {
+         "type": "console"
+      }
+   } ]
+}

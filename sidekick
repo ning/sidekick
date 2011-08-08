@@ -1,0 +1,258 @@
+#!/usr/bin/env node
+/**
+ * This sidekick executes scheduled tasks against an HTTP server.
+ *
+ * Gets its config from a JSON file. config is a hash of one or more:
+ * "task label": {
+ *     "url": "/path/on/boss_host:port/to_execute",
+ *     "frequency": how often to run the task (in seconds)
+ *     "start-delay": how long to wait at first before running the task
+ *     "dedicated-child": whether to run this task in a dedicated child process or the main process
+ * }
+ * 
+ * start-delay is optional, it's useful if you don't want the execution of tasks
+ *   to be bunched, but to be spread out a little.
+ * 
+ * dedicated-child is optional, it defaults to false.
+ *
+ * You can set one task to have a frequency of "initialize" which means the task is
+ *   run once, before any other tasks, and whenever the process receives SIGUSR2. The
+ *   intialization task is not run on a scheduled basis.
+ * You can set one task to have a frequency of "shutdown" which means the task is run
+ *   once whenever the process exits.
+ * 
+ * This process exits:
+ * - when it receives SIGTERM or SIGWINCH
+ * - when it can't connect to the HTTP server it wants to execute tasks on
+ *
+ */
+
+/* Load the node modules we need */
+var http = require('http'),
+    child_process = require('child_process'),
+    fs = require('fs'),
+    getopt = require('getopt'),
+    logger = require('log4js')(null, null, __dirname).getLogger();
+
+/**
+ * Task represents a task to execute
+ *
+ * @param label string task label for human-readable identification
+ * @param props hash of task properties
+ * @param host string host to connect to to execute the task
+ * @param port integer port to connect to host on
+ */
+var Task = function(label, props, host, port) {
+  var self = this;
+
+  self.label = label;
+  self.url = props.url;
+  /** @var frequency integer interval in seconds to repeat task execution */
+  self.frequency = props.frequency;
+  /** @var client HttpClient instance for the task to use */
+  self.client = null;
+  /** How much to delay initial execution (if at all) in seconds */
+  self.delay = props['start-delay'] || null;
+  /** Whether to execute this task in a dedicated child process */
+  self.child = props['dedicated-child'] || null;
+  self.timeoutId = null;
+  self.status = "initialized";
+
+  /** Is this task the special "initialization" task? */
+  self.isInitializationTask = function() { return self.frequency === 'initialize'; };
+
+  /** Is this task the special "shutdown" task? */
+  self.isShutdownTask = function() { return self.frequency === 'shutdown'; };
+
+  /** Is this task a regular periodic scheduled task? */
+  var isScheduledTask = function() {
+     return (! (self.isInitializationTask() || self.isShutdownTask()));
+  };
+
+  /** Run this task, including scheduling the task's next execution */
+  self.run = function() {
+    logger.debug("Running task: " + self.label + " from PID " + process.pid + " --> " + self.url);
+    /* Initialize client on first use */
+    if (self.client === null) {
+        self.client = http.createClient(port, host);
+        self.client.on('error', function (e) {
+              logger.fatal("Can't use client for " + host + ":" + port + " - " + e);
+              process.exit(1);
+          });
+    }
+
+    /* Schedule the next execution if it's a scheduled task */
+    if (isScheduledTask()) {
+        self.timeoutId = setTimeout(self.run, self.frequency * 1000);
+        if (self.status !== 'running') {
+            self.status = 'scheduled';
+        }
+    }
+
+    /* And run the task if it's not already running */
+    if (self.status !== "running") {
+        self.status = "running";
+        var req = self.client.request('GET', self.url, { 'Host': host });
+        req.addListener('response', function(response) {
+            /* Task is done, so set status to reflect that it's been scheduled
+             * for its next run. */
+            self.status = "scheduled";
+            process.emit('task-' + ((response.statusCode == 200) ? 'success' : 'failure'), self, response);
+        });
+        /* Must call end() to fire off the request */
+          req.end();
+    }
+ };
+
+  /** Task constructor logic below **/
+
+  /* If we're the initialization task, run right away. */
+  if (self.isInitializationTask()) {
+    self.run();
+    return;
+  }
+
+  /* Otherwise, run once initialization is complete if it's a regular scheduled task */
+  if (! isScheduledTask()) {
+    return;
+  }
+
+  process.on('initialization-task-complete', function() {
+      /* Spawn a separate process for this task if requested */
+      if (self.child) {
+        var proc = child_process.spawn(process.argv[0], [process.argv[1], '-c', '-l', self.label, '-u', self.url, '-e', self.frequency, '-r', host+":"+port]);
+        proc.stdout.addListener('data', function(data) { logger.debug(data); });
+        proc.stderr.addListener('data', function(data) { logger.error(data); });
+        /* When the parent process dies, kill the child. */
+        process.on('exit', function() { child.kill(); });
+      }
+      else {
+        /* Run the task, modulo the initial delay */
+        if (self.delay) {
+            setTimeout(self.run, self.delay * 1000);
+        } else {
+            self.run();
+        }
+      } /* end of separate-process-or-not check */
+  }); /* end of callback for "initialization-task-complete" event */
+};
+
+/* What to do when a task completes successfully */
+process.on('task-success', function(task) {
+    logger.debug("Task " + task.label + " success from PID " + process.pid);
+    /* If this was the initialization task that just completed at process startup,
+     * set up all the regular scheduled tasks by emitting the right event. */
+    if (task.isInitializationTask()) {
+      process.emit('initialization-task-complete');
+    }
+    else if (task.isShutdownTask()) {
+      process.exit();
+    }
+});
+
+/* What to do when a task fails */
+process.on('task-failure', function(task, response) {
+    logger.error("Task " + task.label + " failure from PID " + process.pid + ": " + response.statusCode);
+    if (task.isShutdownTask()) {
+      process.exit();
+    }
+});
+
+var usage = function() {
+    process.stderr.write(process.argv[1] +
+             " -r HOST:PORT -f FILE -d PID-FILE\n\n" +
+             "   -r HOST:PORT     host:port to call to run jobs\n" +
+             "   -f FILE          configuration file to read tasks from\n" +
+             "   -d PID-FILE      file to write PID into\n");
+};
+
+var parse_args = function(args_to_parse) {
+    /*
+     * -c: child mode
+     * -r: runner host:port to make calls into
+     * -f: config file to read tasks from
+     * -d: PID file to write PID into
+     * -l: task label (child only)
+     * -u: task url (child only)
+     * -e: task frequency (child only)
+     */
+    var args = getopt.parse("cr:f:l:u:e:d:", args_to_parse);
+    
+    args.obey('r','required');
+    args.obey('r','must be a host:port', function(n) { return n.match(/^.+:\d+$/); });
+    if (args['c']) {
+        args.obey('l','required');
+        args.obey('u','required');
+        args.obey('e','required');
+    } else {
+        args.obey('f','required');
+        args.obey('d','required');
+    }
+    var errors = args.validate();
+    if (errors.length) {
+        logger.fatal("Errors: " + errors.join("\n        ") + "\n");
+        usage();
+        process.exit(1);
+    }
+
+    return args;
+};
+
+/* Shut down nicely on various signals */
+var termination_signals = ['SIGHUP','SIGINT','SIGQUIT','SIGILL','SIGABRT','SIGBUS','SIGSEGV','SIGTERM','SIGWINCH'];
+termination_signals.forEach(function(s) { process.on(s, function() { process.emit('time-to-shutdown'); }); });
+
+/* Process args and act accordingly */
+var args = parse_args(process.ARGV);
+/* If we're being invoked in "dedicated process for task" mode, set up the specific task */
+if (args['c']) {
+    /* Set up the task properties from the commnand line arguments */
+    var task_props = { };
+    task_props[args['l']] = {
+        "url": args['u'],
+        "frequency": parseInt(args['e'])
+    };
+} else {
+    /* Otherwise, this is the main process, so we initialize all the tasks from the file */
+    try {
+      /* Remove PID file on exit */
+      process.on('exit', function() { fs.unlinkSync(args['d']); });
+      /* Write PID to PID file */
+      fs.writeFileSync(args['d'], process.pid.toString());
+      /* Read props from file */
+      var task_props = JSON.parse(fs.readFileSync(args['f']));
+    } catch (e) {
+       logger.fatal("Task file load/parse error: " + e.toString());
+       process.exit(1);
+    }
+}
+
+var have_initialization_task = false;
+var have_shutdown_task = false;
+var hostport = args['r'].split(':');
+
+for (var label in task_props) {
+    var task = new Task(label, task_props[label], hostport[0], hostport[1]);
+    if (task.isInitializationTask()) {
+      have_initialization_task = true;
+      /* Re-run initialization task when SIGUSR2 arrives, and
+       * use a closure to capture the loop variable properly.
+       */
+      process.on('SIGUSR2', (function(t) { return function() { t.run(); }; })(task));
+    }
+    else if (task.isShutdownTask()) {
+      have_shutdown_task = true;
+      /* Run the shutdown task when it's time to exit */
+      process.on('time-to-shutdown', (function(t) { return function() { t.run(); }; })(task));
+    }
+}
+
+/* If there was no initialization task to emit this event,
+ * emit it now so that the tasks can start. */
+if (! have_initialization_task) {
+  process.emit('initialization-task-complete');
+};
+/* If there was no shutdown task, then just exit when the time comes */
+if (! have_shutdown_task) {
+  process.on('time-to-shutdown', process.exit );
+}
